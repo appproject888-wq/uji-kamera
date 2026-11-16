@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Uji Kamera Wajah</title>
+<style>
+:root{--bg:#f5f6f8;--fg:#1b1f24;--card:#ffffff;--muted:#68707c;--ok:#1a7f37;--bad:#cf222e;--accent:#2563eb;--border:#d8dde4}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#0f1216;--fg:#e6e9ee;--card:#171b21;--muted:#9aa3ae;--ok:#3fb950;--bad:#f85149;--accent:#58a6ff;--border:#2a3038}}
+:root[data-theme="dark"]{--bg:#0f1216;--fg:#e6e9ee;--card:#171b21;--muted:#9aa3ae;--ok:#3fb950;--bad:#f85149;--accent:#58a6ff;--border:#2a3038}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:960px;margin:0 auto;padding:16px}
+h1{font-size:1.25rem;margin:4px 0 12px}
+h2{font-size:1rem;margin:14px 0 6px}
+.grid{display:grid;gap:12px;grid-template-columns:1fr}
+@media (min-width:760px){.grid{grid-template-columns:1.4fr 1fr}}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px}
+.stage{position:relative;width:100%;aspect-ratio:4/3;background:#000;border-radius:10px;overflow:hidden}
+.stage video,.stage canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;transform:scaleX(-1)}
+.stage canvas{pointer-events:none}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+button{font:inherit;padding:12px 16px;border-radius:10px;border:1px solid var(--border);background:var(--card);color:var(--fg);min-height:44px;cursor:pointer}
+button.primary{background:var(--accent);color:#fff;border-color:transparent}
+button:disabled{opacity:.5;cursor:default}
+.muted{color:var(--muted)}
+.small{font-size:.85rem}
+dl{display:grid;grid-template-columns:auto 1fr;gap:6px 12px;margin:0}
+dt{color:var(--muted)}
+dd{margin:0;font-weight:600;overflow-wrap:anywhere}
+.result{font-size:1.5rem;font-weight:700;padding:12px;border-radius:10px;background:var(--bg);min-height:56px}
+.result.ok{color:var(--ok)}
+.result.bad{color:var(--bad)}
+ul{padding:0;list-style:none;max-height:240px;overflow:auto;font-size:.85rem;margin:0}
+li{padding:4px 0;border-bottom:1px solid var(--border)}
+</style>
+</head>
+<body>
+<main>
+  <h1>Fase 0 · Uji Kamera &amp; Deteksi Wajah</h1>
+  <div class="grid">
+    <section class="card">
+      <div class="stage">
+        <video id="video" playsinline muted></video>
+        <canvas id="overlay"></canvas>
+      </div>
+      <div class="row">
+        <button id="btnStart" class="primary">Mulai Kamera</button>
+        <button id="btnEnroll" disabled>Daftar Wajah (5 sampel)</button>
+        <button id="btnClear" disabled>Hapus Referensi</button>
+      </div>
+      <p id="msg" class="muted">Tekan "Mulai Kamera" lalu izinkan akses kamera.</p>
+    </section>
+
+    <section class="card">
+      <h2>Status</h2>
+      <dl>
+        <dt>Kamera</dt><dd id="sCam">belum aktif</dd>
+        <dt>Model AI</dt><dd id="sModel">belum dimuat</dd>
+        <dt>Wajah terdeteksi</dt><dd id="sFaces">0</dd>
+        <dt>Waktu proses/frame</dt><dd id="sMs">-</dd>
+        <dt>FPS</dt><dd id="sFps">-</dd>
+        <dt>Referensi</dt><dd id="sRef">belum ada</dd>
+      </dl>
+
+      <h2>Hasil kecocokan</h2>
+      <div id="result" class="result">—</div>
+      <p class="muted small">Kecocokan % = (1 − jarak) × 100. Dianggap cocok jika jarak ≤ 0,5.</p>
+
+      <h2>Log</h2>
+      <ul id="log"></ul>
+    </section>
+  </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  // Bobot model tidak ikut paket npm, jadi diambil dari repo GitHub lewat jsdelivr
+  const MODEL_URL = 'https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights';
+  const THRESHOLD = 0.5;        // jarak maksimum dianggap cocok (awal, dikalibrasi di Fase 4)
+  const ENROLL_SAMPLES = 5;     // jumlah sampel saat daftar wajah
+  const ENROLL_GAP_MS = 500;    // jeda minimal antar sampel
+  const DETECT_SIZE = 320;      // ukuran input detektor (kelipatan 32; kecil = lebih cepat)
+
+  const $ = (id) => document.getElementById(id);
+  const video = $('video');
+  const canvas = $('overlay');
+  const ctx = canvas.getContext('2d');
+  const btnStart = $('btnStart');
+  const btnEnroll = $('btnEnroll');
+  const btnClear = $('btnClear');
+
+  let running = false;
+  let modelsReady = false;
+  let refDesc = null;          // Float32Array(128): rata-rata sampel referensi
+  let enroll = null;           // { samples: [], lastT: 0 } saat proses daftar
+  let fpsCount = 0;
+  let fpsT = performance.now();
+
+  function log(text) {
+    const li = document.createElement('li');
+    li.textContent = new Date().toLocaleTimeString('id-ID') + '  ' + text;
+    const list = $('log');
+    list.prepend(li);
+    while (list.children.length > 50) list.lastChild.remove();
+  }
+
+  function setMsg(text) {
+    $('msg').textContent = text;
+  }
+
+  function explainCameraError(e) {
+    const map = {
+      NotAllowedError: 'Izin kamera ditolak. Buka pengaturan situs di browser lalu izinkan kamera.',
+      NotFoundError: 'Tidak ada kamera yang terdeteksi.',
+      NotReadableError: 'Kamera sedang dipakai aplikasi lain.',
+      OverconstrainedError: 'Resolusi kamera tidak didukung.',
+      SecurityError: 'Diblokir keamanan browser (halaman harus HTTPS).'
+    };
+    return (map[e.name] || 'Gagal membuka kamera') + ' [' + e.name + ']';
+  }
+
+  async function loadModels() {
+    if (!window.faceapi) {
+      throw new Error('Library face-api.js gagal dimuat. Cek koneksi internet.');
+    }
+    $('sModel').textContent = 'memuat...';
+    await Promise.all([
+      faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+      faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
+      faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL)
+    ]);
+    modelsReady = true;
+    $('sModel').textContent = 'siap (TinyFaceDetector)';
+    log('Model AI dimuat');
+  }
+
+  async function startCamera() {
+    if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error('Kamera tidak tersedia. Halaman harus dibuka lewat HTTPS atau localhost.');
+    }
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+        audio: false
+      });
+    } catch (e) {
+      throw new Error(explainCameraError(e));
+    }
+    video.srcObject = stream;
+    await video.play();
+  }
+
+  async function keepScreenAwake() {
+    try {
+      await navigator.wakeLock.request('screen');
+      log('Layar dibuat tetap menyala');
+    } catch (_) {
+      log('Wake Lock tidak tersedia (layar mungkin mati otomatis)');
+    }
+  }
+
+  btnStart.addEventListener('click', async () => {
+    btnStart.disabled = true;
+    try {
+      setMsg('Membuka kamera...');
+      await startCamera();
+      $('sCam').textContent = 'aktif (' + video.videoWidth + '×' + video.videoHeight + ')';
+      log('Kamera aktif');
+
+      if (!modelsReady) await loadModels();
+      keepScreenAwake();
+
+      running = true;
+      btnStart.textContent = 'Kamera berjalan';
+      btnEnroll.disabled = false;
+      setMsg('Hadapkan wajah ke kamera.');
+      requestAnimationFrame(loop);
+    } catch (e) {
+      btnStart.disabled = false;
+      $('sCam').textContent = 'gagal';
+      setMsg(e.message);
+      log('ERROR: ' + e.message);
+    }
+  });
+
+  btnEnroll.addEventListener('click', () => {
+    enroll = { samples: [], lastT: 0 };
+    btnEnroll.disabled = true;
+    setMsg('Pandangi kamera dan gerakkan kepala sedikit. Mengambil ' + ENROLL_SAMPLES + ' sampel...');
+    log('Mulai daftar wajah');
+  });
+
+  btnClear.addEventListener('click', () => {
+    refDesc = null;
+    $('sRef').textContent = 'belum ada';
+    $('result').textContent = '—';
+    $('result').className = 'result';
+    btnClear.disabled = true;
+    log('Referensi dihapus');
+  });
+
+  function handleEnroll(faces) {
+    if (!enroll) return;
+    if (faces.length === 0) { setMsg('Wajah belum terdeteksi.'); return; }
+    if (faces.length > 1) { setMsg('Harus tepat 1 wajah di kamera.'); return; }
+
+    const f = faces[0];
+    const now = performance.now();
+    if (f.detection.score < 0.7) return;
+    if (now - enroll.lastT < ENROLL_GAP_MS) return;
+
+    enroll.samples.push(f.descriptor);
+    enroll.lastT = now;
+    setMsg('Sampel ' + enroll.samples.length + '/' + ENROLL_SAMPLES + ' diambil');
+
+    if (enroll.samples.length >= ENROLL_SAMPLES) {
+      const avg = new Float32Array(128);
+      for (const s of enroll.samples) {
+        for (let i = 0; i < 128; i++) avg[i] += s[i] / ENROLL_SAMPLES;
+      }
+      refDesc = avg;
+      enroll = null;
+      $('sRef').textContent = 'tersimpan (rata-rata ' + ENROLL_SAMPLES + ' sampel)';
+      btnEnroll.disabled = false;
+      btnClear.disabled = false;
+      setMsg('Referensi tersimpan. Coba hadapkan wajah yang sama, lalu orang lain.');
+      log('Referensi wajah tersimpan');
+    }
+  }
+
+  function draw(faces) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    let best = null;
+
+    for (const f of faces) {
+      const b = f.detection.box;
+      let color = '#f0883e';
+      let text = 'Wajah ' + (f.detection.score * 100).toFixed(0) + '%';
+
+      if (refDesc) {
+        const d = faceapi.euclideanDistance(refDesc, f.descriptor);
+        const kec = Math.max(0, 1 - d) * 100;
+        const ok = d <= THRESHOLD;
+        color = ok ? '#3fb950' : '#f85149';
+        text = kec.toFixed(1) + '%';
+        if (!best || d < best.d) best = { d: d, kec: kec, ok: ok };
+      }
+
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 3;
+      ctx.strokeRect(b.x, b.y, b.width, b.height);
+
+      // Teks dibalik agar tetap terbaca setelah canvas dicerminkan lewat CSS
+      ctx.save();
+      ctx.translate(b.x + b.width, b.y - 6);
+      ctx.scale(-1, 1);
+      ctx.font = 'bold 18px system-ui, sans-serif';
+      ctx.fillStyle = color;
+      ctx.fillText(text, 0, 0);
+      ctx.restore();
+    }
+
+    if (refDesc) {
+      const r = $('result');
+      if (best) {
+        r.textContent = best.kec.toFixed(1) + '% — ' + (best.ok ? 'COCOK' : 'TIDAK COCOK') +
+                        ' (jarak ' + best.d.toFixed(3) + ')';
+        r.className = 'result ' + (best.ok ? 'ok' : 'bad');
+      } else {
+        r.textContent = 'Tidak ada wajah';
+        r.className = 'result';
+      }
+    }
+  }
+
+  function countFps() {
+    fpsCount++;
+    const now = performance.now();
+    if (now - fpsT >= 1000) {
+      $('sFps').textContent = (fpsCount * 1000 / (now - fpsT)).toFixed(1);
+      fpsCount = 0;
+      fpsT = now;
+    }
+  }
+
+  async function loop() {
+    if (!running) return;
+    try {
+      if (video.readyState >= 2 && modelsReady) {
+        if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+        }
+        const t0 = performance.now();
+        const faces = await faceapi
+          .detectAllFaces(video, new faceapi.TinyFaceDetectorOptions({ inputSize: DETECT_SIZE, scoreThreshold: 0.5 }))
+          .withFaceLandmarks()
+          .withFaceDescriptors();
+        $('sMs').textContent = (performance.now() - t0).toFixed(0) + ' ms';
+        $('sFaces').textContent = faces.length;
+        draw(faces);
+        handleEnroll(faces);
+        countFps();
+      }
+    } catch (e) {
+      log('ERROR deteksi: ' + e.message);
+    }
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
